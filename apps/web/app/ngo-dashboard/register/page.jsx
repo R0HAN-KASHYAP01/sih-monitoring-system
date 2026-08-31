@@ -55,7 +55,7 @@ function RegisterInstituteForm() {
       region,
       state,
       district,
-      status: 'active',
+      status: 'pending',
     });
 
     if (instituteError) throw instituteError;
