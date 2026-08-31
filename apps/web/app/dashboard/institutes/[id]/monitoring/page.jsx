@@ -1,124 +1,397 @@
-// FILE: apps/web/app/dashboard/institutes/[id]/monitoring/page.jsx
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { useParams } from 'next/navigation';
+import Link from 'next/link';
 import RoleGuard from '../../../../../lib/RoleGuard';
 import { supabase } from '../../../../../lib/supabaseClient';
+import StatCard from '../../../../../components/dashboard/dashboard/StatCard';
+import StatusBadge from '../../../../../components/dashboard/dashboard/StatusBadge';
+import AttendanceTrendChart from '../../../../../components/dashboard/dashboard/AttendanceTrendChart';
+import ReportCard from '../../../../../components/dashboard/dashboard/ReportCard';
+import CameraCard from '../../../../../components/dashboard/dashboard/CameraCard';
+
+const DEVIATION_THRESHOLD = 30; // existing business rule, percent
+
+function computeDeviationPct(record) {
+  const reported = record?.reported_count;
+  const historical = record?.historical_average;
+  if (typeof reported !== 'number' || typeof historical !== 'number' || historical === 0) return null;
+  return ((reported - historical) / historical) * 100;
+}
+
+function getDeviationStatus(pct) {
+  if (pct === null || pct === undefined) return 'unknown';
+  return Math.abs(pct) >= DEVIATION_THRESHOLD ? 'flagged' : 'normal';
+}
+
+function formatPct(pct) {
+  if (pct === null || pct === undefined) return '—';
+  const sign = pct > 0 ? '+' : '';
+  return `${sign}${pct.toFixed(1)}%`;
+}
+
+function getLatestCameraStatus(camera) {
+  const logs = camera?.cctv_status_log || [];
+  if (logs.length === 0) return { status: 'unknown', checkedAt: null };
+  const sorted = [...logs].sort((a, b) => new Date(b.checked_at) - new Date(a.checked_at));
+  const raw = (sorted[0]?.status || '').toLowerCase();
+  const status = raw === 'online' || raw === 'offline' ? raw : 'unknown';
+  return { status, checkedAt: sorted[0]?.checked_at || null };
+}
+
+function getLastUpdated(attendance, reports, cameras) {
+  const timestamps = [];
+  if (attendance[0]?.date) timestamps.push(new Date(attendance[0].date).getTime());
+  if (reports[0]?.created_at) timestamps.push(new Date(reports[0].created_at).getTime());
+  cameras.forEach((cam) => {
+    (cam.cctv_status_log || []).forEach((log) => {
+      if (log.checked_at) timestamps.push(new Date(log.checked_at).getTime());
+    });
+  });
+  if (timestamps.length === 0) return null;
+  return new Date(Math.max(...timestamps));
+}
+
+function HeaderSkeleton() {
+  return (
+    <div className="animate-pulse">
+      <div className="mb-3 h-3 w-40 rounded bg-gray-200" />
+      <div className="mb-2 h-7 w-64 rounded bg-gray-200" />
+      <div className="h-4 w-80 rounded bg-gray-200" />
+    </div>
+  );
+}
+
+function CardsSkeleton() {
+  return (
+    <div className="grid grid-cols-2 gap-4 lg:grid-cols-6">
+      {Array.from({ length: 6 }).map((_, i) => (
+        <div key={i} className="animate-pulse rounded-xl border border-gray-200 bg-white p-5">
+          <div className="mb-3 h-3 w-20 rounded bg-gray-200" />
+          <div className="h-6 w-12 rounded bg-gray-200" />
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function SectionSkeleton() {
+  return (
+    <div className="animate-pulse rounded-xl border border-gray-200 bg-white p-5">
+      <div className="mb-4 h-4 w-40 rounded bg-gray-200" />
+      <div className="space-y-2">
+        <div className="h-3 w-full rounded bg-gray-100" />
+        <div className="h-3 w-full rounded bg-gray-100" />
+        <div className="h-3 w-2/3 rounded bg-gray-100" />
+      </div>
+    </div>
+  );
+}
 
 function InstituteMonitoringView() {
   const { id } = useParams();
+
   const [institute, setInstitute] = useState(null);
   const [attendance, setAttendance] = useState([]);
   const [reports, setReports] = useState([]);
   const [cameras, setCameras] = useState([]);
+
   const [loading, setLoading] = useState(true);
+  const [fatalError, setFatalError] = useState(null);
+  const [partialError, setPartialError] = useState(null);
+
+  const load = async () => {
+    setLoading(true);
+    setFatalError(null);
+    setPartialError(null);
+
+    const [instRes, attRes, repRes, camRes] = await Promise.all([
+      supabase.from('institutes').select('id, name, region, state, district, status').eq('id', id).single(),
+      supabase
+        .from('attendance')
+        .select('id, date, reported_count, historical_average')
+        .eq('institute_id', id)
+        .order('date', { ascending: false })
+        .limit(10),
+      supabase
+        .from('reports')
+        .select('id, content_text, similarity_score, created_at')
+        .eq('institute_id', id)
+        .order('created_at', { ascending: false })
+        .limit(10),
+      supabase
+        .from('cctv_cameras')
+        .select('id, label, cctv_status_log(status, checked_at)')
+        .eq('institute_id', id),
+    ]);
+
+    if (instRes.error) {
+      setFatalError(instRes.error.message || 'Failed to load institute.');
+      setLoading(false);
+      return;
+    }
+
+    setInstitute(instRes.data);
+    setAttendance(attRes.data || []);
+    setReports(repRes.data || []);
+    setCameras(camRes.data || []);
+
+    const partialIssues = [attRes.error, repRes.error, camRes.error].filter(Boolean);
+    if (partialIssues.length > 0) {
+      setPartialError('Some monitoring data could not be loaded. Figures below may be incomplete.');
+    }
+
+    setLoading(false);
+  };
 
   useEffect(() => {
-    const load = async () => {
-      const [instRes, attRes, repRes, camRes] = await Promise.all([
-        supabase.from('institutes').select('id, name, region, state, district, status').eq('id', id).single(),
-        supabase.from('attendance').select('id, date, reported_count, historical_average')
-          .eq('institute_id', id).order('date', { ascending: false }).limit(10),
-        supabase.from('reports').select('id, content_text, similarity_score, created_at')
-          .eq('institute_id', id).order('created_at', { ascending: false }).limit(10),
-        supabase.from('cctv_cameras').select('id, label, cctv_status_log(status, checked_at)')
-          .eq('institute_id', id),
-      ]);
-
-      setInstitute(instRes.data);
-      setAttendance(attRes.data || []);
-      setReports(repRes.data || []);
-      setCameras(camRes.data || []);
-      setLoading(false);
-    };
-
-    load();
+    if (id) load();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [id]);
 
-  if (loading) return <p className="p-8 text-sm text-gray-500">Loading...</p>;
-  if (!institute) return <p className="p-8 text-sm text-red-600">Institute not found.</p>;
+  const latestAttendance = attendance[0] || null;
+  const latestDeviationPct = useMemo(() => computeDeviationPct(latestAttendance), [latestAttendance]);
+  const latestDeviationStatus = getDeviationStatus(latestDeviationPct);
+
+  const ascendingAttendance = useMemo(() => [...attendance].reverse(), [attendance]);
+
+  const cameraStatuses = useMemo(() => cameras.map((cam) => getLatestCameraStatus(cam)), [cameras]);
+  const onlineCount = cameraStatuses.filter((c) => c.status === 'online').length;
+  const offlineCount = cameraStatuses.filter((c) => c.status === 'offline').length;
+
+  const lastUpdated = useMemo(() => getLastUpdated(attendance, reports, cameras), [attendance, reports, cameras]);
+
+  if (loading) {
+    return (
+      <div className="min-h-screen bg-gray-50">
+        <div className="border-b border-gray-200 bg-white">
+          <div className="mx-auto max-w-6xl px-4 py-6 sm:px-6 lg:px-8">
+            <HeaderSkeleton />
+          </div>
+        </div>
+        <div className="mx-auto max-w-6xl space-y-8 px-4 py-8 sm:px-6 lg:px-8">
+          <CardsSkeleton />
+          <SectionSkeleton />
+          <SectionSkeleton />
+        </div>
+      </div>
+    );
+  }
+
+  if (fatalError) {
+    return (
+      <div className="mx-auto max-w-2xl px-4 py-16 text-center">
+        <p className="text-sm font-medium text-red-700">Couldn&apos;t load this institute</p>
+        <p className="mt-1 text-sm text-gray-500">{fatalError}</p>
+        <div className="mt-4 flex justify-center gap-3">
+          <button
+            onClick={load}
+            className="rounded-lg border border-gray-300 px-4 py-2 text-sm font-medium text-gray-700 transition-colors hover:bg-gray-50"
+          >
+            Retry
+          </button>
+          <Link
+            href="/dashboard"
+            className="rounded-lg bg-blue-600 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-blue-700"
+          >
+            Back to Dashboard
+          </Link>
+        </div>
+      </div>
+    );
+  }
+
+  if (!institute) {
+    return (
+      <div className="mx-auto max-w-2xl px-4 py-16 text-center">
+        <p className="text-sm font-medium text-gray-900">Institute not found</p>
+        <p className="mt-1 text-sm text-gray-500">This institute may have been removed or the link is invalid.</p>
+        <Link
+          href="/dashboard"
+          className="mt-4 inline-block rounded-lg bg-blue-600 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-blue-700"
+        >
+          Back to Dashboard
+        </Link>
+      </div>
+    );
+  }
 
   return (
-    <div className="mx-auto max-w-3xl p-8">
-      <h1 className="mb-1 text-xl font-semibold">{institute.name}</h1>
-      <p className="mb-6 text-sm text-gray-500">
-        {institute.region}, {institute.district}, {institute.state} — Status: {institute.status}
-      </p>
+    <div className="min-h-screen bg-gray-50">
+      {/* Header */}
+      <header className="border-b border-gray-200 bg-white">
+        <div className="mx-auto max-w-6xl px-4 py-6 sm:px-6 lg:px-8">
+          <nav className="mb-3 flex items-center gap-1.5 text-xs text-gray-500">
+            <Link href="/dashboard" className="transition-colors hover:text-gray-700">
+              Dashboard
+            </Link>
+            <span aria-hidden="true">/</span>
+            <span className="font-medium text-gray-700">{institute.name}</span>
+          </nav>
 
-      {/* Attendance */}
-      <section className="mb-8">
-        <h2 className="mb-3 text-base font-semibold">Attendance (last 10)</h2>
-        {attendance.length === 0 ? (
-          <p className="text-sm text-gray-500">No attendance submitted yet.</p>
-        ) : (
-          <table className="w-full border-collapse text-sm">
-            <thead>
-              <tr className="border-b text-left text-gray-500">
-                <th className="py-2">Date</th>
-                <th className="py-2">Reported</th>
-                <th className="py-2">Historical Avg</th>
-                <th className="py-2">Deviation</th>
-              </tr>
-            </thead>
-            <tbody>
-              {attendance.map((row) => {
-                const deviation = row.historical_average
-                  ? Math.round((Math.abs(row.reported_count - row.historical_average) / row.historical_average) * 100)
-                  : null;
-                return (
-                  <tr key={row.id} className="border-b">
-                    <td className="py-2">{row.date}</td>
-                    <td className="py-2">{row.reported_count}</td>
-                    <td className="py-2">{row.historical_average ?? '—'}</td>
-                    <td className={`py-2 ${deviation >= 30 ? 'font-medium text-orange-600' : ''}`}>
-                      {deviation !== null ? `${deviation}%` : '—'}
-                    </td>
-                  </tr>
-                );
+          <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+            <div>
+              <div className="flex flex-wrap items-center gap-3">
+                <h1 className="text-xl font-semibold text-gray-900 sm:text-2xl">{institute.name}</h1>
+                <StatusBadge status={institute.status} />
+              </div>
+              <p className="mt-1 text-sm text-gray-500">
+                {[institute.region, institute.district, institute.state].filter(Boolean).join(', ') || 'Location not set'}
+              </p>
+              <p className="mt-1 text-xs text-gray-400">
+                {lastUpdated ? `Last updated ${lastUpdated.toLocaleString()}` : 'No monitoring activity recorded yet'}
+              </p>
+            </div>
+
+            <Link
+              href="/dashboard"
+              className="inline-flex w-fit items-center gap-1.5 rounded-lg border border-gray-300 bg-white px-4 py-2 text-sm font-medium text-gray-700 transition-colors hover:bg-gray-50 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-1"
+            >
+              <span aria-hidden="true">←</span>
+              Back to Dashboard
+            </Link>
+          </div>
+        </div>
+      </header>
+
+      <main className="mx-auto max-w-6xl space-y-8 px-4 py-8 sm:px-6 lg:px-8">
+        {partialError && (
+          <div className="flex items-center justify-between rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800">
+            <span>{partialError}</span>
+            <button
+              onClick={load}
+              className="ml-4 rounded-md border border-amber-300 bg-white px-3 py-1.5 text-xs font-medium text-amber-800 transition-colors hover:bg-amber-100"
+            >
+              Retry
+            </button>
+          </div>
+        )}
+
+        {/* Monitoring summary */}
+        <section>
+          <h2 className="mb-3 text-sm font-semibold text-gray-900">Monitoring Summary</h2>
+          <div className="grid grid-cols-2 gap-4 lg:grid-cols-6">
+            <StatCard
+              label="Attendance Status"
+              value={latestAttendance ? (latestDeviationStatus === 'flagged' ? 'Flagged' : 'Normal') : 'No data'}
+              tone={latestAttendance ? (latestDeviationStatus === 'flagged' ? 'rejected' : 'approved') : 'default'}
+            />
+            <StatCard
+              label="Attendance Deviation"
+              value={formatPct(latestDeviationPct)}
+              tone={latestAttendance ? (latestDeviationStatus === 'flagged' ? 'rejected' : 'approved') : 'default'}
+              hint={latestAttendance ? `vs. historical avg on ${new Date(latestAttendance.date).toLocaleDateString()}` : undefined}
+            />
+            <StatCard label="Recent Reports" value={reports.length} tone="default" hint="of last 10 fetched" />
+            <StatCard label="Total Cameras" value={cameras.length} tone="default" />
+            <StatCard label="Online Cameras" value={onlineCount} tone="approved" />
+            <StatCard label="Offline Cameras" value={offlineCount} tone="rejected" />
+          </div>
+        </section>
+
+        {/* Attendance */}
+        <section className="rounded-xl border border-gray-200 bg-white p-5">
+          <div className="mb-4 flex items-center justify-between">
+            <h2 className="text-sm font-semibold text-gray-900">Attendance (last {attendance.length || 0})</h2>
+            <span className="text-xs text-gray-400">Flag threshold: ±{DEVIATION_THRESHOLD}%</span>
+          </div>
+
+          {attendance.length === 0 ? (
+            <p className="py-8 text-center text-sm text-gray-500">No attendance submitted yet.</p>
+          ) : (
+            <>
+              {ascendingAttendance.length > 1 && (
+                <div className="mb-6 border-b border-gray-100 pb-6">
+                  <AttendanceTrendChart records={ascendingAttendance} />
+                </div>
+              )}
+
+              <div className="overflow-x-auto">
+                <table className="w-full min-w-[520px] border-collapse text-sm">
+                  <thead>
+                    <tr className="border-b border-gray-200 text-left text-xs font-medium uppercase tracking-wide text-gray-500">
+                      <th className="py-2 pr-4">Date</th>
+                      <th className="py-2 pr-4">Reported</th>
+                      <th className="py-2 pr-4">Historical Avg</th>
+                      <th className="py-2 pr-4">Deviation</th>
+                      <th className="py-2">Status</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-gray-100">
+                    {attendance.map((record) => {
+                      const pct = computeDeviationPct(record);
+                      const status = getDeviationStatus(pct);
+                      return (
+                        <tr key={record.id} className="transition-colors hover:bg-gray-50">
+                          <td className="py-2.5 pr-4 text-gray-700">
+                            {record.date ? new Date(record.date).toLocaleDateString() : '—'}
+                          </td>
+                          <td className="py-2.5 pr-4 text-gray-700">{record.reported_count ?? '—'}</td>
+                          <td className="py-2.5 pr-4 text-gray-700">
+                            {typeof record.historical_average === 'number' ? record.historical_average.toFixed(1) : '—'}
+                          </td>
+                          <td
+                            className={`py-2.5 pr-4 font-medium ${
+                              status === 'flagged' ? 'text-red-600' : status === 'normal' ? 'text-emerald-600' : 'text-gray-400'
+                            }`}
+                          >
+                            {formatPct(pct)}
+                          </td>
+                          <td className="py-2.5">
+                            <StatusBadge status={status} compact />
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            </>
+          )}
+        </section>
+
+        {/* Reports */}
+        <section>
+          <h2 className="mb-3 text-sm font-semibold text-gray-900">Reports ({reports.length})</h2>
+          {reports.length === 0 ? (
+            <div className="rounded-xl border border-gray-200 bg-white p-8 text-center text-sm text-gray-500">
+              No reports submitted yet.
+            </div>
+          ) : (
+            <div className="space-y-3">
+              {reports.map((report) => (
+                <ReportCard
+                  key={report.id}
+                  content={report.content_text}
+                  createdAt={report.created_at}
+                  similarityScore={typeof report.similarity_score === 'number' ? report.similarity_score : undefined}
+                />
+              ))}
+            </div>
+          )}
+        </section>
+
+        {/* CCTV */}
+        <section>
+          <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+            <h2 className="text-sm font-semibold text-gray-900">CCTV Coverage ({cameras.length})</h2>
+            <p className="text-xs text-gray-400">Simulated status feed — live streaming not yet integrated</p>
+          </div>
+          {cameras.length === 0 ? (
+            <div className="rounded-xl border border-gray-200 bg-white p-8 text-center text-sm text-gray-500">
+              No cameras registered for this institute.
+            </div>
+          ) : (
+            <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
+              {cameras.map((camera, i) => {
+                const { status, checkedAt } = cameraStatuses[i];
+                return <CameraCard key={camera.id} label={camera.label} status={status} checkedAt={checkedAt} />;
               })}
-            </tbody>
-          </table>
-        )}
-      </section>
-
-      {/* Reports */}
-      <section className="mb-8">
-        <h2 className="mb-3 text-base font-semibold">Reports (last 10)</h2>
-        {reports.length === 0 ? (
-          <p className="text-sm text-gray-500">No reports submitted yet.</p>
-        ) : (
-          <ul className="space-y-3">
-            {reports.map((r) => (
-              <li key={r.id} className="rounded border border-gray-200 p-3 text-sm">
-                <p className="mb-1 text-gray-500">{new Date(r.created_at).toLocaleString()}</p>
-                <p>{r.content_text}</p>
-              </li>
-            ))}
-          </ul>
-        )}
-      </section>
-
-      {/* CCTV */}
-      <section>
-        <h2 className="mb-3 text-base font-semibold">CCTV Cameras</h2>
-        {cameras.length === 0 ? (
-          <p className="text-sm text-gray-500">No cameras registered.</p>
-        ) : (
-          <ul className="space-y-2">
-            {cameras.map((cam) => {
-              const latest = cam.cctv_status_log?.[0];
-              const status = latest?.status || 'unknown';
-              return (
-                <li key={cam.id} className="flex items-center justify-between rounded border border-gray-200 p-3 text-sm">
-                  <span>{cam.label}</span>
-                  <span className={status === 'online' ? 'text-green-600' : 'text-red-600'}>{status}</span>
-                </li>
-              );
-            })}
-          </ul>
-        )}
-      </section>
+            </div>
+          )}
+        </section>
+      </main>
     </div>
   );
 }
