@@ -4,6 +4,7 @@
 import { useEffect, useState } from 'react';
 import RoleGuard from '../../../lib/RoleGuard';
 import { supabase } from '../../../lib/supabaseClient';
+import { triggerRiskRecompute } from '../../../lib/triggerRiskRecompute';
 import { getMyApprovedInstitutes } from '../../../lib/getMyApprovedInstitutes';
 
 function CctvManager() {
@@ -65,7 +66,7 @@ function CctvManager() {
       setError(insertError.message);
       return;
     }
-
+    triggerRiskRecompute(instituteId);
     loadCameras();
   };
 

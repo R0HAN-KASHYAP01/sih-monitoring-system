@@ -1,3 +1,5 @@
+// FILE: apps/web/app/dashboard/institutes/[id]/monitoring/page.jsx
+
 'use client';
 
 import { useEffect, useMemo, useState } from 'react';
@@ -13,11 +15,22 @@ import CameraCard from '../../../../../components/dashboard/dashboard/CameraCard
 
 const DEVIATION_THRESHOLD = 30; // existing business rule, percent
 
-function computeDeviationPct(record) {
-  const reported = record?.reported_count;
-  const historical = record?.historical_average;
-  if (typeof reported !== 'number' || typeof historical !== 'number' || historical === 0) return null;
-  return ((reported - historical) / historical) * 100;
+// Historical average is no longer a stored column — it's computed the same
+// way the AI risk engine computes it: the average of every OLDER submission
+// than the one being evaluated. `recordsDescByDate` must be sorted newest-first.
+function computeHistoricalAverage(record, recordsDescByDate) {
+  const idx = recordsDescByDate.findIndex((r) => r.id === record.id);
+  const olderRecords = recordsDescByDate.slice(idx + 1);
+  if (olderRecords.length === 0) return null;
+  const sum = olderRecords.reduce((acc, r) => acc + (r.reported_count || 0), 0);
+  return sum / olderRecords.length;
+}
+
+function computeDeviationPct(reported, historicalAverage) {
+  if (typeof reported !== 'number' || typeof historicalAverage !== 'number' || historicalAverage === 0) {
+    return null;
+  }
+  return ((reported - historicalAverage) / historicalAverage) * 100;
 }
 
 function getDeviationStatus(pct) {
@@ -93,7 +106,7 @@ function InstituteMonitoringView() {
   const { id } = useParams();
 
   const [institute, setInstitute] = useState(null);
-  const [attendance, setAttendance] = useState([]);
+  const [attendance, setAttendance] = useState([]); // newest-first, each row enriched with computed historical_average
   const [reports, setReports] = useState([]);
   const [cameras, setCameras] = useState([]);
 
@@ -110,7 +123,8 @@ function InstituteMonitoringView() {
       supabase.from('institutes').select('id, name, region, state, district, status').eq('id', id).single(),
       supabase
         .from('attendance')
-        .select('id, date, reported_count, historical_average')
+        // historical_average column no longer selected — it's computed client-side below
+        .select('id, date, reported_count, created_at')
         .eq('institute_id', id)
         .order('date', { ascending: false })
         .limit(10),
@@ -133,7 +147,16 @@ function InstituteMonitoringView() {
     }
 
     setInstitute(instRes.data);
-    setAttendance(attRes.data || []);
+
+    // Enrich each attendance row with a computed historical average,
+    // based on every OLDER row in this same fetched set (newest-first order).
+    const rawAttendance = attRes.data || [];
+    const enrichedAttendance = rawAttendance.map((record) => ({
+      ...record,
+      historical_average: computeHistoricalAverage(record, rawAttendance),
+    }));
+
+    setAttendance(enrichedAttendance);
     setReports(repRes.data || []);
     setCameras(camRes.data || []);
 
@@ -151,7 +174,10 @@ function InstituteMonitoringView() {
   }, [id]);
 
   const latestAttendance = attendance[0] || null;
-  const latestDeviationPct = useMemo(() => computeDeviationPct(latestAttendance), [latestAttendance]);
+  const latestDeviationPct = useMemo(() => {
+    if (!latestAttendance) return null;
+    return computeDeviationPct(latestAttendance.reported_count, latestAttendance.historical_average);
+  }, [latestAttendance]);
   const latestDeviationStatus = getDeviationStatus(latestDeviationPct);
 
   const ascendingAttendance = useMemo(() => [...attendance].reverse(), [attendance]);
@@ -281,7 +307,7 @@ function InstituteMonitoringView() {
               label="Attendance Deviation"
               value={formatPct(latestDeviationPct)}
               tone={latestAttendance ? (latestDeviationStatus === 'flagged' ? 'rejected' : 'approved') : 'default'}
-              hint={latestAttendance ? `vs. historical avg on ${new Date(latestAttendance.date).toLocaleDateString()}` : undefined}
+              hint={latestAttendance ? `vs. computed avg on ${new Date(latestAttendance.date).toLocaleDateString()}` : undefined}
             />
             <StatCard label="Recent Reports" value={reports.length} tone="default" hint="of last 10 fetched" />
             <StatCard label="Total Cameras" value={cameras.length} tone="default" />
@@ -313,14 +339,14 @@ function InstituteMonitoringView() {
                     <tr className="border-b border-gray-200 text-left text-xs font-medium uppercase tracking-wide text-gray-500">
                       <th className="py-2 pr-4">Date</th>
                       <th className="py-2 pr-4">Reported</th>
-                      <th className="py-2 pr-4">Historical Avg</th>
+                      <th className="py-2 pr-4">Computed Avg</th>
                       <th className="py-2 pr-4">Deviation</th>
                       <th className="py-2">Status</th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-gray-100">
                     {attendance.map((record) => {
-                      const pct = computeDeviationPct(record);
+                      const pct = computeDeviationPct(record.reported_count, record.historical_average);
                       const status = getDeviationStatus(pct);
                       return (
                         <tr key={record.id} className="transition-colors hover:bg-gray-50">
@@ -347,6 +373,9 @@ function InstituteMonitoringView() {
                   </tbody>
                 </table>
               </div>
+              <p className="mt-3 text-xs text-gray-400">
+                Computed Avg is the average of every earlier submission for this institute — the same calculation the risk engine uses. It's not a stored value, so the oldest row in this list always shows "—" (no earlier data to compare against).
+              </p>
             </>
           )}
         </section>

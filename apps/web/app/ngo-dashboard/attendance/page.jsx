@@ -5,13 +5,13 @@ import { useEffect, useState } from 'react';
 import RoleGuard from '../../../lib/RoleGuard';
 import { supabase } from '../../../lib/supabaseClient';
 import { getMyApprovedInstitutes } from '../../../lib/getMyApprovedInstitutes';
+import { triggerRiskRecompute } from '../../../lib/triggerRiskRecompute';
 
 function AttendanceUploadForm() {
   const [institutes, setInstitutes] = useState([]);
   const [instituteId, setInstituteId] = useState('');
   const [date, setDate] = useState('');
   const [reportedCount, setReportedCount] = useState('');
-  const [historicalAverage, setHistoricalAverage] = useState('');
   const [error, setError] = useState('');
   const [success, setSuccess] = useState('');
   const [loading, setLoading] = useState(false);
@@ -28,11 +28,12 @@ function AttendanceUploadForm() {
 
     const { data: { session } } = await supabase.auth.getSession();
 
+    // historical_average is no longer collected here — the risk engine
+    // computes it itself from prior submissions at recompute time.
     const { error: insertError } = await supabase.from('attendance').insert({
       institute_id: instituteId,
       date,
       reported_count: parseInt(reportedCount, 10),
-      historical_average: historicalAverage ? parseFloat(historicalAverage) : null,
       submitted_by: session.user.id,
     });
 
@@ -43,6 +44,7 @@ function AttendanceUploadForm() {
       return;
     }
 
+    triggerRiskRecompute(instituteId);
     setSuccess('Attendance submitted.');
     setReportedCount('');
     setDate('');
@@ -79,13 +81,9 @@ function AttendanceUploadForm() {
             className="w-full rounded border border-gray-300 px-3 py-2 text-sm" />
         </div>
 
-        <div>
-          <label className="mb-1 block text-sm text-gray-600">
-            Historical average (optional — used later by the risk engine)
-          </label>
-          <input type="number" min="0" step="0.1" value={historicalAverage} onChange={(e) => setHistoricalAverage(e.target.value)}
-            className="w-full rounded border border-gray-300 px-3 py-2 text-sm" />
-        </div>
+        <p className="text-xs text-gray-400">
+          Historical average is now calculated automatically from your institute's past submissions.
+        </p>
 
         <button type="submit" disabled={loading}
           className="w-full rounded bg-blue-600 py-2 text-sm font-medium text-white hover:bg-blue-700 disabled:opacity-50">

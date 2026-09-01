@@ -4,5 +4,9 @@
   "workspaces": [
     "apps/web",
     "packages/shared"
-  ]
+  ],
+  "dependencies": {
+    "@supabase/supabase-js": "^2.112.4",
+    "react-native-url-polyfill": "^4.0.0"
+  }
 }

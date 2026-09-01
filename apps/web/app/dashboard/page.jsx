@@ -1,3 +1,5 @@
+// FILE: apps/web/app/dashboard/page.jsx
+
 'use client';
 
 import { useEffect, useMemo, useState } from 'react';
@@ -6,6 +8,7 @@ import RoleGuard from '../../lib/RoleGuard';
 import { supabase } from '../../lib/supabaseClient';
 import StatCard from '../../components/dashboard/dashboard/StatCard';
 import StatusBadge from '../../components/dashboard/dashboard/StatusBadge';
+import RiskBadge from '../../components/dashboard/dashboard/RiskBadge';
 
 function formatStatusLabel(status) {
   if (!status) return 'Unknown';
@@ -47,9 +50,13 @@ function DashboardContent() {
   const [districtFilter, setDistrictFilter] = useState('');
   const [statusFilter, setStatusFilter] = useState('all');
 
+  const [recomputingAll, setRecomputingAll] = useState(false);
+  const [recomputeSummary, setRecomputeSummary] = useState(null);
+
   const loadInstitutes = async () => {
     setLoading(true);
     setError(null);
+
     const { data, error: fetchError } = await supabase
       .from('institutes')
       .select('id, name, region, state, district, status, created_at')
@@ -58,15 +65,87 @@ function DashboardContent() {
     if (fetchError) {
       setError(fetchError.message || 'Failed to load institutes.');
       setInstitutes([]);
-    } else {
-      setInstitutes(data || []);
+      setLoading(false);
+      return;
     }
+
+    // Attach each institute's most recent risk score, if one exists.
+    const withRisk = await Promise.all(
+      (data || []).map(async (inst) => {
+        const { data: riskRows } = await supabase
+          .from('risk_scores')
+          .select('score, band, computed_at')
+          .eq('institute_id', inst.id)
+          .order('computed_at', { ascending: false })
+          .limit(1);
+
+        return { ...inst, latestRisk: riskRows?.[0] || null };
+      })
+    );
+
+    setInstitutes(withRisk);
     setLoading(false);
   };
 
   useEffect(() => {
     loadInstitutes();
   }, []);
+
+  useEffect(() => {
+    const channel = supabase
+      .channel('risk_scores_changes')
+      .on(
+        'postgres_changes',
+        { event: 'INSERT', schema: 'public', table: 'risk_scores' },
+        (payload) => {
+          const newRisk = payload.new;
+          setInstitutes((prev) =>
+            prev.map((inst) =>
+              inst.id === newRisk.institute_id
+                ? { ...inst, latestRisk: { score: newRisk.score, band: newRisk.band, computed_at: newRisk.computed_at } }
+                : inst
+            )
+          );
+        }
+      )
+      .subscribe();
+
+    return () => {
+      supabase.removeChannel(channel);
+    };
+  }, []);
+
+  // Recomputes every institute's risk score, not just ones with new incoming data.
+  // Runs sequentially (not Promise.all) so the AI service isn't hit with a burst
+  // of simultaneous requests — fine for MVP data volumes, and the realtime
+  // subscription above will update each row live as results come in.
+  const handleRecomputeAll = async () => {
+    setRecomputingAll(true);
+    setRecomputeSummary(null);
+
+    let succeeded = 0;
+    let failed = 0;
+
+    for (const inst of institutes) {
+      try {
+        const res = await fetch('/api/risk/recompute', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ instituteId: inst.id }),
+        });
+        if (res.ok) {
+          succeeded += 1;
+        } else {
+          failed += 1;
+        }
+      } catch {
+        failed += 1;
+      }
+    }
+
+    setRecomputingAll(false);
+    setRecomputeSummary({ succeeded, failed, total: institutes.length });
+  };
 
   const statusCounts = useMemo(() => {
     const counts = {};
@@ -76,6 +155,11 @@ function DashboardContent() {
     }
     return counts;
   }, [institutes]);
+
+  const highRiskCount = useMemo(
+    () => institutes.filter((inst) => ['HIGH', 'CRITICAL'].includes(inst.latestRisk?.band)).length,
+    [institutes]
+  );
 
   const availableStatuses = useMemo(() => Object.keys(statusCounts).sort(), [statusCounts]);
 
@@ -110,7 +194,7 @@ function DashboardContent() {
       {/* Header */}
       <header className="border-b border-gray-200 bg-white">
         <div className="mx-auto max-w-7xl px-4 py-6 sm:px-6 lg:px-8">
-          <div className="flex flex-col gap-1 sm:flex-row sm:items-center sm:justify-between">
+          <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
             <div>
               <h1 className="text-xl font-semibold text-gray-900 sm:text-2xl">
                 Institution Monitoring Dashboard
@@ -119,14 +203,40 @@ function DashboardContent() {
                 Department of Social Justice &amp; Empowerment — registered institutions overview
               </p>
             </div>
-            <Link
-              href="/dashboard/pending"
-              className="mt-3 inline-flex w-fit items-center gap-1.5 rounded-lg border border-gray-300 bg-white px-4 py-2 text-sm font-medium text-gray-700 transition-colors hover:bg-gray-50 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-1 sm:mt-0"
-            >
-              View Pending Registrations
-              <span aria-hidden="true">→</span>
-            </Link>
+
+            <div className="flex flex-wrap items-center gap-3">
+              <Link
+                href="/dashboard/pending"
+                className="inline-flex w-fit items-center gap-1.5 rounded-lg border border-gray-300 bg-white px-4 py-2 text-sm font-medium text-gray-700 transition-colors hover:bg-gray-50 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-1"
+              >
+                View Pending Registrations
+                <span aria-hidden="true">→</span>
+              </Link>
+
+              <Link
+                href="/dashboard/alerts"
+                className="inline-flex w-fit items-center gap-1.5 rounded-lg border border-red-200 bg-white px-4 py-2 text-sm font-medium text-red-600 transition-colors hover:bg-red-50 focus:outline-none focus:ring-2 focus:ring-red-500 focus:ring-offset-1"
+              >
+                View High/Critical Alerts
+                <span aria-hidden="true">→</span>
+              </Link>
+
+              <button
+                onClick={handleRecomputeAll}
+                disabled={recomputingAll || institutes.length === 0}
+                className="inline-flex items-center gap-1.5 rounded-lg bg-blue-600 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-blue-700 disabled:opacity-50"
+              >
+                {recomputingAll ? `Recomputing... (${recomputeSummary?.succeeded ?? 0}/${institutes.length})` : 'Recompute All Risk Scores'}
+              </button>
+            </div>
           </div>
+
+          {recomputeSummary && !recomputingAll && (
+            <p className="mt-3 text-xs text-gray-500">
+              Recomputed {recomputeSummary.succeeded} of {recomputeSummary.total} institutes
+              {recomputeSummary.failed > 0 ? ` (${recomputeSummary.failed} failed — check that the AI service is running)` : ''}.
+            </p>
+          )}
         </div>
       </header>
 
@@ -145,9 +255,10 @@ function DashboardContent() {
         )}
 
         {/* KPI cards */}
-        <section className="mb-8 grid grid-cols-2 gap-4 lg:grid-cols-4">
+        <section className="mb-8 grid grid-cols-2 gap-4 lg:grid-cols-5">
           {loading ? (
             <>
+              <StatCardSkeleton />
               <StatCardSkeleton />
               <StatCardSkeleton />
               <StatCardSkeleton />
@@ -159,6 +270,7 @@ function DashboardContent() {
               <StatCard label="Approved" value={statusCounts.approved || 0} tone="approved" />
               <StatCard label="Pending Registrations" value={statusCounts.pending || 0} tone="pending" />
               <StatCard label="Rejected" value={statusCounts.rejected || 0} tone="rejected" />
+              <StatCard label="High / Critical Risk" value={highRiskCount} tone="rejected" />
             </>
           )}
         </section>
@@ -329,7 +441,9 @@ function DashboardContent() {
                       <td className="px-4 py-3">
                         <StatusBadge status={inst.status} />
                       </td>
-                      <td className="px-4 py-3 text-gray-400">Not yet available</td>
+                      <td className="px-4 py-3">
+                        <RiskBadge score={inst.latestRisk?.score} band={inst.latestRisk?.band} />
+                      </td>
                       <td className="px-4 py-3 text-right">
                         <Link
                           href={`/dashboard/institutes/${inst.id}/monitoring`}

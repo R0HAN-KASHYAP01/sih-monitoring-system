@@ -5,6 +5,8 @@ import { useEffect, useState } from 'react';
 import RoleGuard from '../../../lib/RoleGuard';
 import { supabase } from '../../../lib/supabaseClient';
 import { getMyApprovedInstitutes } from '../../../lib/getMyApprovedInstitutes';
+import { triggerRiskRecompute } from '../../../lib/triggerRiskRecompute';
+
 
 function ReportUploadForm() {
   const [institutes, setInstitutes] = useState([]);
@@ -38,7 +40,7 @@ function ReportUploadForm() {
       setError(insertError.message);
       return;
     }
-
+    triggerRiskRecompute(instituteId); 
     setSuccess('Report submitted.');
     setContentText('');
   };
