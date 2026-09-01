@@ -4,5 +4,10 @@
   "workspaces": [
     "apps/web",
     "packages/shared"
-  ]
+  ],
+  "dependencies": {
+    "lucide-react": "^1.38.0",
+    "react-icons": "^5.7.0",
+    "recharts": "^3.10.1"
+  }
 }
